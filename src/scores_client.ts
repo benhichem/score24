@@ -21,6 +21,23 @@ export interface LeagueMatch {
     short_name: string;
     country?: { iso: string };
   }>;
+  status: { code: string };
+  is_live: boolean;
+  is_finished: boolean;
+  winner?: number;
+  odds?: MatchOdds;
+}
+
+export interface MatchOdds {
+  markets: string[];
+  lines: Array<{
+    market: string;
+    rates: Array<{
+      outcome: string;
+      outcome_value?: string | null;
+      value: number;
+    }>;
+  }>;
 }
 
 export interface LeagueData {
@@ -154,6 +171,88 @@ export class Scores24Client {
     });
 
     return result.data || [];
+  }
+
+  /**
+   * Fetches leagues and matches for Table Tennis within a specific date range,
+   * and filters them to ONLY return matches that have odds (has_odds === true).
+   * Leagues that do not contain any matches with odds are excluded.
+   */
+  public async getTableTennisLeaguesWithOdds(startDate: string, endDate: string): Promise<LeagueData[]> {
+    const allLeagues = await this.getTableTennisLeagues(startDate, endDate);
+    return allLeagues
+      .map((leagueData) => {
+        const matchesWithOdds = (leagueData.matches || []).filter((match) => match.has_odds);
+        return {
+          ...leagueData,
+          matches: matchesWithOdds,
+        };
+      })
+      .filter((leagueData) => leagueData.matches.length > 0);
+  }
+
+  /**
+   * Fetches detailed odds (lines) for a specific match.
+   */
+  public async getMatchOdds(sportSlug: string, matchSlug: string): Promise<MatchOdds | null> {
+    await this.ensureSession();
+
+    console.log(`[Scores24Client] Fetching odds for match ${matchSlug}...`);
+
+    try {
+      const result = await this.page!.evaluate(async (params) => {
+        const url = `https://scores24.live/rapi/localized/matches/${encodeURIComponent(params.sportSlug)}/${encodeURIComponent(params.matchSlug)}/lines?lang=en&audience=us`;
+
+        const headers = {
+          "accept": "*/*",
+          "accept-language": "en-US,en;q=0.9",
+          "x-api-token": params.token,
+          "x-bot-identifier": "client",
+          "x-country": "dz",
+          "x-ssr-ip": params.ip,
+          "x-user-cache": params.userCache,
+          "x-user-ip": params.ip,
+          "x-requested-with": "XMLHttpRequest"
+        };
+
+        const response = await fetch(url, { method: "GET", headers });
+
+        if (!response.ok) {
+          throw new Error(`API returned status ${response.status}: ${await response.text()}`);
+        }
+
+        return response.json();
+      }, {
+        matchSlug,
+        sportSlug,
+        token: this.token!,
+        ip: this.ip!,
+        userCache: this.userCache!
+      });
+
+      if (!result?.data?.lines?.edges) return null;
+
+      const lines = result.data.lines.edges.map((edge: any) => {
+        const node = edge.node;
+        const rates = node.topRates?.[0]?.values?.map((val: any) => ({
+          outcome: val.outcome,
+          outcome_value: val.outcome_value,
+          value: val.value
+        })) || [];
+        return {
+          market: node.market,
+          rates
+        };
+      });
+
+      return {
+        markets: result.data.markets || [],
+        lines
+      };
+    } catch (e) {
+      console.error(`[Scores24Client] Failed to fetch odds for ${matchSlug}:`, e);
+      return null;
+    }
   }
 
   public async close() {
