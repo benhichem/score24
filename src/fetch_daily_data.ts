@@ -8,8 +8,9 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function run() {
   const client = new Scores24Client();
   
-  // Use today's date. In UTC for the API:
-  const dateStr = "2026-06-21"; // Today's date based on current time
+  // Dynamically compute today's date in YYYY-MM-DD format (UTC)
+  const now = new Date();
+  const dateStr = now.toISOString().split("T")[0]; // e.g. "2026-06-22"
   const startDate = `${dateStr} 00:00:00`;
   const endDate = `${dateStr} 23:59:59`;
 
