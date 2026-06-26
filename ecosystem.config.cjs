@@ -31,6 +31,21 @@ module.exports = {
       out_file: "./logs/live-odds-server.log",
       error_file: "./logs/live-odds-server-error.log",
       merge_logs: true
+    },
+    {
+      name: "scheduled-odds-poller",
+      script: "src/scheduled_odds_poller.ts",
+      interpreter: "bun",
+      autorestart: true,         // Long-lived; matches can run past midnight, no cron_restart
+      watch: false,
+      max_memory_restart: "512M",
+      env: {
+        NODE_ENV: "production"
+      },
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      out_file: "./logs/scheduled-odds-poller.log",
+      error_file: "./logs/scheduled-odds-poller-error.log",
+      merge_logs: true
     }
   ]
 };

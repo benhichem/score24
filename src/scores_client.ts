@@ -55,13 +55,26 @@ export interface LeagueData {
   matches: LeagueMatch[];
 }
 
+export async function launchSharedBrowser(): Promise<Browser> {
+  return puppeteer.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+}
+
 export class Scores24Client {
   private browser: Browser | null = null;
   private page: Page | null = null;
+  private ownsBrowser: boolean;
   private token: string | null = null;
   private ip: string | null = null;
   private userCache: string | null = null;
   private tokenExpiry: number = 0; // UTC timestamp in seconds
+
+  constructor(sharedBrowser?: Browser) {
+    this.browser = sharedBrowser ?? null;
+    this.ownsBrowser = !sharedBrowser;
+  }
 
   private async initBrowser() {
     if (!this.browser) {
@@ -256,11 +269,14 @@ export class Scores24Client {
   }
 
   public async close() {
-    if (this.browser) {
+    if (this.page) {
+      await this.page.close();
+      this.page = null;
+    }
+    if (this.browser && this.ownsBrowser) {
       console.log("[Scores24Client] Closing browser...");
       await this.browser.close();
       this.browser = null;
-      this.page = null;
     }
   }
 }
