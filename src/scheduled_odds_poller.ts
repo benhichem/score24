@@ -101,7 +101,11 @@ function promoteDueMatches() {
 // Each worker has its own Page (and thus its own session/token) but shares one Browser process.
 async function pollOneMatch(match: ActiveMatch, client: Scores24Client) {
   if (match.state === "POLLING") {
+<<<<<<< HEAD
     const odds = await client.getMatchOdds(match.sportSlug, match.slug, match.matchDateIso.split("T")[0]);
+=======
+    const odds = await client.getMatchOdds(match.sportSlug, match.slug);
+>>>>>>> 6af9ebd376d473d2f1a4f22d0655194af13aad3e
 
     if (odds) {
       match.everHadOdds = true;
