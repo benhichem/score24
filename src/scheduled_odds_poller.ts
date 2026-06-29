@@ -1,14 +1,13 @@
 import fs from "fs/promises";
 import path from "path";
-import { Scores24Client, launchSharedBrowser, type MatchOdds, type LeagueData } from "./scores_client";
+import { Scores24Client, type MatchOdds, type LeagueData } from "./scores_client";
 
 const DATA_DIR = process.env.DATA_DIR ?? "data";
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 60_000);
-const WORKER_POOL_SIZE = Number(process.env.WORKER_POOL_SIZE ?? 4);
-const INTER_MATCH_DELAY_MS = 750;
+const IDLE_WAIT_MS = Number(process.env.POLL_INTERVAL_MS ?? 60_000); // when the queue is empty
+const INTER_MATCH_DELAY_MS = 750; // pacing between sequential requests -- keeps us under Cloudflare's rate limit
 const MAX_PRE_ODDS_ATTEMPTS = 3;
 const MAX_CONFIRM_ATTEMPTS = 3;
-const FILE_DISCOVERY_EVERY_N_TICKS = 3; // ~3 min at the default 60s interval
+const FILE_DISCOVERY_INTERVAL_MS = 3 * 60_000;
 
 type MatchState = "PENDING" | "POLLING" | "CONFIRMING_FINISHED";
 
@@ -29,6 +28,24 @@ interface LiveOddsEntry {
 
 const activeMatches = new Map<string, ActiveMatch>();
 const seenSourceFiles = new Set<string>();
+
+// FIFO queue of slugs awaiting their next poll, oldest-due first. A match
+// that's still active gets pushed to the back after being polled, so it
+// naturally cycles through in order without needing concurrent workers.
+const queue: string[] = [];
+const queuedSlugs = new Set<string>();
+
+function enqueue(slug: string) {
+  if (queuedSlugs.has(slug)) return;
+  queue.push(slug);
+  queuedSlugs.add(slug);
+}
+
+function dequeue(): string | undefined {
+  const slug = queue.shift();
+  if (slug !== undefined) queuedSlugs.delete(slug);
+  return slug;
+}
 
 function stripDatePrefix(slug: string): string {
   return slug.replace(/^\d{2}-\d{2}-\d{4}-/, "");
@@ -93,19 +110,15 @@ function promoteDueMatches() {
   for (const match of activeMatches.values()) {
     if (match.state === "PENDING" && new Date(match.matchDateIso).getTime() <= now) {
       match.state = "POLLING";
+      enqueue(match.slug);
       console.log(`[Scheduler] ${match.slug} is due -> POLLING`);
     }
   }
 }
 
-// Each worker has its own Page (and thus its own session/token) but shares one Browser process.
 async function pollOneMatch(match: ActiveMatch, client: Scores24Client) {
   if (match.state === "POLLING") {
-<<<<<<< HEAD
     const odds = await client.getMatchOdds(match.sportSlug, match.slug, match.matchDateIso.split("T")[0]);
-=======
-    const odds = await client.getMatchOdds(match.sportSlug, match.slug);
->>>>>>> 6af9ebd376d473d2f1a4f22d0655194af13aad3e
 
     if (odds) {
       match.everHadOdds = true;
@@ -130,7 +143,7 @@ async function pollOneMatch(match: ActiveMatch, client: Scores24Client) {
   }
 
   if (match.state === "CONFIRMING_FINISHED") {
-    const info = await client.getMatchInfo(ddmmyyyy(match.matchDateIso), match.slug);
+    const info = await client.getMatchInfo(match.sportSlug, ddmmyyyy(match.matchDateIso), match.slug);
 
     if (info?.is_finished) {
       console.log(`[Scheduler] ${match.slug}: confirmed finished, stopping`);
@@ -151,64 +164,76 @@ async function pollOneMatch(match: ActiveMatch, client: Scores24Client) {
   }
 }
 
-// Round-robin the due matches across the worker pool, then run each worker's
-// batch sequentially -- but all workers run concurrently via Promise.all.
-async function pollBatch(toPoll: ActiveMatch[], workers: Scores24Client[]) {
-  const buckets: ActiveMatch[][] = Array.from({ length: workers.length }, () => []);
-  toPoll.forEach((match, i) => buckets[i % workers.length].push(match));
-
-  await Promise.all(
-    buckets.map(async (bucket, workerIndex) => {
-      const client = workers[workerIndex]!;
-      for (const match of bucket) {
-        await pollOneMatch(match, client);
-        await Bun.sleep(INTER_MATCH_DELAY_MS);
-      }
-    })
-  );
+async function waitForScheduleFile(): Promise<void> {
+  const filename = todayFileName();
+  const filePath = path.join(DATA_DIR, filename);
+  while (true) {
+    try {
+      await fs.access(filePath);
+      console.log(`[Scheduler] ${filename} found, starting.`);
+      return;
+    } catch {
+      console.log(`[Scheduler] Waiting for ${filename} (daily-fetcher hasn't run yet)...`);
+      await Bun.sleep(30_000);
+    }
+  }
 }
 
-let tickCount = 0;
-let isTicking = false;
+// Single sequential loop: one match at a time, oldest-due first. Trades a
+// little freshness for never hammering the API concurrently -- a few seconds
+// of lag per match is fine, getting rate-limited or crashing the page isn't.
+async function runQueueLoop(client: Scores24Client) {
+  let lastDiscoveryAt = 0;
 
-async function tick(workers: Scores24Client[]) {
-  if (isTicking) return;
-  isTicking = true;
-  try {
-    tickCount++;
-    if (tickCount === 1 || tickCount % FILE_DISCOVERY_EVERY_N_TICKS === 0) {
+  while (true) {
+    const now = Date.now();
+    if (now - lastDiscoveryAt >= FILE_DISCOVERY_INTERVAL_MS || lastDiscoveryAt === 0) {
       await loadScheduleFile(todayFileName());
+      lastDiscoveryAt = now;
     }
 
     promoteDueMatches();
 
-    const toPoll = [...activeMatches.values()].filter(
-      (m) => m.state === "POLLING" || m.state === "CONFIRMING_FINISHED"
-    );
-    await pollBatch(toPoll, workers);
-  } catch (err) {
-    console.error("[Scheduler] Tick error:", err);
-  } finally {
-    isTicking = false;
+    const slug = dequeue();
+    if (!slug) {
+      await Bun.sleep(IDLE_WAIT_MS);
+      continue;
+    }
+
+    const match = activeMatches.get(slug);
+    if (match) {
+      try {
+        await pollOneMatch(match, client);
+      } catch (err) {
+        console.error(`[Scheduler] Error polling ${slug}:`, err);
+      }
+
+      if (activeMatches.has(slug) && (match.state === "POLLING" || match.state === "CONFIRMING_FINISHED")) {
+        enqueue(slug);
+      }
+    }
+
+    await Bun.sleep(INTER_MATCH_DELAY_MS);
   }
 }
 
 async function main() {
   await fs.mkdir(DATA_DIR, { recursive: true });
+  await waitForScheduleFile();
   await loadScheduleFile(todayFileName());
 
-  const sharedBrowser = await launchSharedBrowser();
-  const workers = Array.from({ length: WORKER_POOL_SIZE }, () => new Scores24Client(sharedBrowser));
+  const client = new Scores24Client();
+  console.log(`[Scheduler] Started. Single sequential worker, ~${INTER_MATCH_DELAY_MS}ms between matches.`);
 
-  setInterval(() => tick(workers), POLL_INTERVAL_MS);
-  console.log(`[Scheduler] Started. ${WORKER_POOL_SIZE} workers, polling every ${POLL_INTERVAL_MS}ms.`);
-
-  process.on("SIGINT", async () => {
+  const shutdown = async () => {
     console.log("\n[Scheduler] Shutting down...");
-    await Promise.all(workers.map((w) => w.close()));
-    await sharedBrowser.close();
+    await client.close();
     process.exit(0);
-  });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  await runQueueLoop(client);
 }
 
 main();

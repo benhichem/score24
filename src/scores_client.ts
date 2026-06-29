@@ -55,11 +55,14 @@ export interface LeagueData {
   matches: LeagueMatch[];
 }
 
-export async function launchSharedBrowser(): Promise<Browser> {
-  return puppeteer.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
+function isoToDdMmYyyy(isoDate: string): string {
+  const [y, m, d] = isoDate.split("T")[0].split("-");
+  return `${d}-${m}-${y}`;
+}
+
+export interface MatchInfo {
+  is_finished: boolean;
+  is_live: boolean;
 }
 
 export class Scores24Client {
@@ -93,6 +96,24 @@ export class Scores24Client {
     }
   }
 
+  // Crashed/navigated-away frames leave the Page object unusable forever;
+  // drop it so the next ensureSession() call creates a fresh one.
+  private async recoverFromPageCrash(e: unknown): Promise<boolean> {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes("detached Frame") && !msg.includes("disposed")) return false;
+
+    console.warn("[Scores24Client] Page crashed, recreating for next attempt...");
+    try {
+      await this.page?.close();
+    } catch {
+      // already gone
+    }
+    this.page = null;
+    this.token = null;
+    this.tokenExpiry = 0;
+    return true;
+  }
+
   private decodeTokenExpiry(token: string): number {
     try {
       const base64Payload = token.split(".")[0];
@@ -103,7 +124,7 @@ export class Scores24Client {
     }
   }
 
-  private async ensureSession() {
+  public async ensureSession() {
     await this.initBrowser();
 
     const now = Math.floor(Date.now() / 1000);
@@ -206,11 +227,15 @@ export class Scores24Client {
 
   /**
    * Fetches detailed odds (lines) for a specific match.
+   * `isoDate` (YYYY-MM-DD) is required when `matchSlug` is the bare slug (no
+   * date prefix) -- it's used to rebuild the DD-MM-YYYY-slug the API expects.
+   * Omit it when `matchSlug` is already date-prefixed.
    */
-  public async getMatchOdds(sportSlug: string, matchSlug: string): Promise<MatchOdds | null> {
+  public async getMatchOdds(sportSlug: string, matchSlug: string, isoDate?: string): Promise<MatchOdds | null> {
     await this.ensureSession();
 
-    console.log(`[Scores24Client] Fetching odds for match ${matchSlug}...`);
+    const fullSlug = isoDate ? `${isoToDdMmYyyy(isoDate)}-${matchSlug}` : matchSlug;
+    console.log(`[Scores24Client] Fetching odds for match ${fullSlug}...`);
 
     try {
       const result = await this.page!.evaluate(async (params) => {
@@ -236,7 +261,7 @@ export class Scores24Client {
 
         return response.json();
       }, {
-        matchSlug,
+        matchSlug: fullSlug,
         sportSlug,
         token: this.token!,
         ip: this.ip!,
@@ -263,7 +288,61 @@ export class Scores24Client {
         lines
       };
     } catch (e) {
+      await this.recoverFromPageCrash(e);
       console.error(`[Scores24Client] Failed to fetch odds for ${matchSlug}:`, e);
+      return null;
+    }
+  }
+
+  /**
+   * Fetches match status (is_live / is_finished) for a bare slug + its match date.
+   */
+  public async getMatchInfo(sportSlug: string, ddmmyyyyDate: string, matchSlug: string): Promise<MatchInfo | null> {
+    await this.ensureSession();
+
+    const fullSlug = `${ddmmyyyyDate}-${matchSlug}`;
+    console.log(`[Scores24Client] Fetching match info for ${fullSlug}...`);
+
+    try {
+      const result = await this.page!.evaluate(async (params) => {
+        const url = `https://scores24.live/rapi/localized/matches/${encodeURIComponent(params.sportSlug)}/${encodeURIComponent(params.matchSlug)}?lang=en&audience=us`;
+
+        const headers = {
+          "accept": "*/*",
+          "accept-language": "en-US,en;q=0.9",
+          "x-api-token": params.token,
+          "x-bot-identifier": "client",
+          "x-country": "dz",
+          "x-ssr-ip": params.ip,
+          "x-user-cache": params.userCache,
+          "x-user-ip": params.ip,
+          "x-requested-with": "XMLHttpRequest"
+        };
+
+        const response = await fetch(url, { method: "GET", headers });
+
+        if (!response.ok) {
+          throw new Error(`API returned status ${response.status}: ${await response.text()}`);
+        }
+
+        return response.json();
+      }, {
+        matchSlug: fullSlug,
+        sportSlug,
+        token: this.token!,
+        ip: this.ip!,
+        userCache: this.userCache!
+      });
+
+      if (!result?.data) return null;
+
+      return {
+        is_finished: !!result.data.is_finished,
+        is_live: !!result.data.is_live
+      };
+    } catch (e) {
+      await this.recoverFromPageCrash(e);
+      console.error(`[Scores24Client] Failed to fetch match info for ${fullSlug}:`, e);
       return null;
     }
   }
