@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "command": "npx",
+      "args": ["@mcpmarket/ssh-remote-connection"],
+      "disabled": false
+    }
+  }
+}
