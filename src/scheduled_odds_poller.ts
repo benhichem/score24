@@ -90,7 +90,7 @@ async function loadScheduleFile(filename: string) {
   console.log(`[Scheduler] Loaded ${filename}: ${activeMatches.size} matches tracked total`);
 }
 
-async function appendLiveOdds(slug: string, odds: MatchOdds) {
+async function appendLiveOdds(slug: string, odds: MatchOdds): Promise<boolean> {
   const outDir = path.join(DATA_DIR, "live");
   await fs.mkdir(outDir, { recursive: true });
   const filePath = path.join(outDir, `${slug}.json`);
@@ -101,8 +101,15 @@ async function appendLiveOdds(slug: string, odds: MatchOdds) {
   } catch {
     // first write for this match
   }
+
+  const last = history.at(-1);
+  if (last && JSON.stringify(last.odds) === JSON.stringify(odds)) {
+    return false; // odds unchanged, skip write
+  }
+
   history.push({ timestamp: new Date().toISOString(), odds });
   await fs.writeFile(filePath, JSON.stringify(history, null, 2), "utf-8");
+  return true;
 }
 
 function promoteDueMatches() {
@@ -123,8 +130,9 @@ async function pollOneMatch(match: ActiveMatch, client: Scores24Client) {
     if (odds) {
       match.everHadOdds = true;
       match.attemptsSinceLastSuccess = 0;
-      await appendLiveOdds(match.slug, odds);
-      console.log(`[Scheduler] ${match.slug}: odds updated`);
+      const changed = await appendLiveOdds(match.slug, odds);
+      if (changed) console.log(`[Scheduler] ${match.slug}: odds changed, written`);
+      else console.log(`[Scheduler] ${match.slug}: odds unchanged, skipped write`);
       return;
     }
 
